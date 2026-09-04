@@ -1,0 +1,6 @@
+.DS_Store
+.conan2/
+build/
+dist/
+*.user
+*.user.*

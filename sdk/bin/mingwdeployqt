@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    echo "Usage: mingwdeployqt --qt <5|6> --source <file-or-dir> --dest <dir> [--search DLL_DIR ...]" >&2
+    exit 2
+}
+
+qt_major=""
+source_path=""
+dest_dir=""
+search_dirs=()
+while (($#)); do
+    case "$1" in
+        --qt) qt_major="${2:-}"; shift 2 ;;
+        --source) source_path="${2:-}"; shift 2 ;;
+        --dest) dest_dir="${2:-}"; shift 2 ;;
+        --search) search_dirs+=("${2:-}"); shift 2 ;;
+        -h|--help) usage ;;
+        *) echo "Unknown argument: $1" >&2; usage ;;
+    esac
+done
+[[ "$qt_major" == 5 || "$qt_major" == 6 ]] || usage
+[[ -n "$source_path" && -e "$source_path" && -n "$dest_dir" ]] || usage
+if ((${#search_dirs[@]})); then
+    for search_dir in "${search_dirs[@]}"; do
+        [[ -d "$search_dir" ]] || { echo "DLL search directory not found: $search_dir" >&2; exit 1; }
+    done
+fi
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+sdk_root="$(cd "$script_dir/.." && pwd)"
+qt_root="$sdk_root/qt$qt_major/package"
+[[ -d "$qt_root" ]] || { echo "Qt $qt_major SDK not found: $qt_root" >&2; exit 1; }
+
+mkdir -p "$dest_dir"
+if [[ -d "$source_path" ]]; then
+    source_abs="$(cd "$source_path" && pwd)"
+    dest_abs="$(cd "$dest_dir" && pwd)"
+    [[ "$source_abs" == "$dest_abs" ]] || rsync -a "$source_abs/" "$dest_abs/"
+else
+    cp "$source_path" "$dest_dir/"
+fi
+
+# Plugins are deployed with their Qt-relative directories. This covers platform,
+# multimedia, image format, TLS, style and future plugin categories.
+if [[ -d "$qt_root/plugins" ]]; then
+    rsync -a --include='*/' --include='*.dll' --exclude='*' "$qt_root/plugins/" "$dest_dir/"
+fi
+if [[ -d "$qt_root/translations" ]]; then
+    mkdir -p "$dest_dir/translations"
+    rsync -a --include='*/' --include='*.qm' --exclude='*' "$qt_root/translations/" "$dest_dir/translations/"
+fi
+
+objdump_bin="$(command -v x86_64-w64-mingw32-objdump)"
+mingw_prefix="$(brew --prefix mingw-w64)"
+find_paths=("$qt_root/bin" "$qt_root/lib" "$sdk_root/runtime" "$mingw_prefix/toolchain-x86_64")
+if ((${#search_dirs[@]})); then
+    find_paths+=("${search_dirs[@]}")
+fi
+
+find_dll() {
+    local wanted="$1"
+    local found=""
+    found="$(find "${find_paths[@]}" \
+        -type f -iname "$wanted" -print -quit 2>/dev/null || true)"
+    [[ -n "$found" ]] && printf '%s\n' "$found"
+    return 0
+}
+
+is_system_dll() {
+    local name
+    name="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+    [[ "$name" == api-ms-win-* || "$name" == ext-ms-win-* ]] && return 0
+    case "$name" in
+        advapi32.dll|authz.dll|avrt.dll|bcrypt.dll|cfgmgr32.dll|comdlg32.dll|crypt32.dll|d2d1.dll|d3d9.dll|d3d11.dll|d3d12.dll|dbghelp.dll|dnsapi.dll|dwrite.dll|dwmapi.dll|dxgi.dll|dxva2.dll|evr.dll|gdi32.dll|imm32.dll|iphlpapi.dll|kernel32.dll|mf.dll|mfplat.dll|mfreadwrite.dll|mpr.dll|msvcrt.dll|ncrypt.dll|netapi32.dll|ntdll.dll|ole32.dll|oleaut32.dll|opengl32.dll|powrprof.dll|propsys.dll|secur32.dll|setupapi.dll|shcore.dll|shell32.dll|shlwapi.dll|user32.dll|userenv.dll|uxtheme.dll|version.dll|winhttp.dll|winmm.dll|winspool.drv|ws2_32.dll|wtsapi32.dll) return 0 ;;
+    esac
+    return 1
+}
+
+has_deployed_file() {
+    find "$dest_dir" -type f -iname "$1" -print -quit | grep -q .
+}
+
+changed=1
+while ((changed)); do
+    changed=0
+    while IFS= read -r binary; do
+        while IFS= read -r dll; do
+            [[ -n "$dll" ]] || continue
+            is_system_dll "$dll" && continue
+            has_deployed_file "$dll" && continue
+            dll_path="$(find_dll "$dll")"
+            if [[ -n "$dll_path" ]]; then
+                cp "$dll_path" "$dest_dir/"
+                echo "deployed: $dll"
+                changed=1
+            else
+                echo "warning: unresolved DLL: $dll (required by ${binary#$dest_dir/})" >&2
+            fi
+        done < <("$objdump_bin" -p "$binary" 2>/dev/null | awk '/DLL Name:/{print $3}')
+    done < <(find "$dest_dir" -type f \( -iname '*.exe' -o -iname '*.dll' \) -print)
+done
+
+echo "Deploy directory ready: $dest_dir"

@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    echo "Usage: makensis-package --source DIR --output DIR --name NAME --version VERSION --exe FILE [--publisher NAME] [--icon APP.ico]" >&2
+    exit 2
+}
+
+source_dir=""; output_dir=""; app_name=""; app_version=""; main_exe=""; publisher=""; app_icon=""
+while (($#)); do
+    case "$1" in
+        --source) source_dir="${2:-}"; shift 2 ;;
+        --output) output_dir="${2:-}"; shift 2 ;;
+        --name) app_name="${2:-}"; shift 2 ;;
+        --version) app_version="${2:-}"; shift 2 ;;
+        --exe) main_exe="${2:-}"; shift 2 ;;
+        --publisher) publisher="${2:-}"; shift 2 ;;
+        --icon) app_icon="${2:-}"; shift 2 ;;
+        -h|--help) usage ;;
+        *) echo "Unknown argument: $1" >&2; usage ;;
+    esac
+done
+[[ -d "$source_dir" && -n "$output_dir" && -n "$app_name" && -n "$app_version" && -n "$main_exe" ]] || usage
+[[ -f "$source_dir/$main_exe" ]] || { echo "Executable not found: $source_dir/$main_exe" >&2; exit 1; }
+[[ -z "$app_icon" || -f "$app_icon" ]] || { echo "Icon file not found: $app_icon" >&2; exit 1; }
+command -v makensis >/dev/null || { echo "makensis is missing; run: brew install nsis" >&2; exit 1; }
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+template="$script_dir/../share/nsis/package.nsi"
+sdk_root="$(cd "$script_dir/.." && pwd)"
+mkdir -p "$sdk_root/tmp"
+export TMPDIR="$sdk_root/tmp"
+mkdir -p "$output_dir"
+source_dir="$(cd "$source_dir" && pwd)"
+output_dir="$(cd "$output_dir" && pwd)"
+app_id="$(printf '%s' "$app_name" | tr -cd '[:alnum:]_.-')"
+[[ -n "$app_id" ]] || { echo "Application name must contain an ASCII letter or digit" >&2; exit 1; }
+publisher="${publisher:-$app_name}"
+
+# Windows VERSIONINFO requires exactly four numeric components. Keep the
+# human-facing APP_VERSION unchanged and normalize a separate product value.
+IFS=. read -r -a version_parts <<<"$app_version"
+product_version=""
+for index in 0 1 2 3; do
+    part="${version_parts[$index]:-0}"
+    [[ "$part" =~ ^[0-9]+$ ]] || { echo "Version must contain numeric dot-separated components" >&2; exit 1; }
+    product_version+="${product_version:+.}$part"
+done
+
+common_defs=(
+    "-DAPP_NAME=$app_name" "-DAPP_ID=$app_id" "-DAPP_VERSION=$app_version"
+    "-DPRODUCT_VERSION=$product_version"
+    "-DMAIN_EXE=$main_exe" "-DPUBLISHER=$publisher"
+    "-DSOURCE_DIR=$source_dir" "-DOUTPUT_DIR=$output_dir"
+)
+if [[ -n "$app_icon" ]]; then
+    app_icon="$(cd "$(dirname "$app_icon")" && pwd)/$(basename "$app_icon")"
+    common_defs+=("-DAPP_ICON=$app_icon")
+fi
+makensis "${common_defs[@]}" -DBUILD_INSTALLER "$template"
+makensis "${common_defs[@]}" -DBUILD_UPDATE "$template"
+echo "Installer and update package written to: $output_dir"
